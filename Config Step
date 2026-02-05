@@ -1,0 +1,438 @@
+sudo nano /etc/hosts 10.10.1.226   ldap01
+10.10.1.227   ldap02
+10.10.1.228   ldap03
+
+getent hosts ldap02
+getent hosts ldap03
+
+
+STEP 1 – Set timezone (samakan dulu)
+
+Jalankan di:
+
+ldap01
+
+ldap02
+
+ldap03
+
+sudo timedatectl set-timezone Asia/Jakarta
+
+
+Cek:
+
+timedatectl
+
+
+Pastikan:
+
+Time zone: Asia/Jakarta
+
+✅ STEP 2 – Aktifkan NTP bawaan systemd
+
+Di semua server:
+
+sudo timedatectl set-ntp true
+
+✅ STEP 3 – Pastikan service time sync aktif
+
+Di semua server:
+
+systemctl status systemd-timesyncd
+
+
+Harusnya:
+
+Active: active (running)
+
+
+Kalau belum aktif:
+
+sudo systemctl enable --now systemd-timesyncd
+
+✅ STEP 4 – Paksa refresh sinkronisasi
+
+Di semua server:
+
+sudo systemctl restart systemd-timesyncd
+
+
+Tunggu ±10–20 detik.
+
+✅ STEP 5 – Cek apakah sudah sinkron
+
+Di masing-masing server:
+
+timedatectl
+
+
+Yang penting:
+
+System clock synchronized: yes
+NTP service: active
+
+✅ STEP 6 – Cek jam real (bandingkan antar server)
+
+Di ldap01:
+
+date
+
+
+Di ldap02:
+
+date
+
+
+Di ldap03:
+
+date
+
+
+Selisih harusnya hanya mili-detik / detik.
+
+
+===============================
+🔵 BAGIAN 1 – ldap01 (10.10.1.226)
+===============================
+
+Jalankan SEMUA di ldap01
+
+1️⃣ Pastikan ldapi aktif
+grep SLAPD_SERVICES /etc/default/slapd
+
+
+Harus:
+
+SLAPD_SERVICES="ldap:/// ldapi:///"
+
+
+Kalau belum, edit dan restart:
+
+nano /etc/default/slapd
+systemctl restart slapd
+
+2️⃣ Test akses cn=config
+ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config dn | head
+
+
+Harus keluar banyak dn.
+
+3️⃣ Cek nomor database mdb
+ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config '(olcDatabase=mdb)' dn
+
+
+➡️ Catat.
+
+Biasanya:
+
+dn: olcDatabase={1}mdb,cn=config
+
+
+Saya asumsikan:
+
+👉 {1}
+
+4️⃣ Set serverID (ldap01)
+cat > serverid.ldif <<EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: 1 ldap://ldap01
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f serverid.ldif
+
+
+Cek:
+
+ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config olcServerID
+
+5️⃣ Load module syncprov
+cat > syncprov-module.ldif <<EOF
+dn: cn=module{0},cn=config
+changetype: modify
+add: olcModuleLoad
+olcModuleLoad: syncprov
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncprov-module.ldif
+
+6️⃣ Pasang overlay syncprov
+cat > syncprov-overlay.ldif <<EOF
+dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcSyncProvConfig
+olcOverlay: syncprov
+olcSpCheckpoint: 100 10
+olcSpSessionlog: 100
+EOF
+
+ldapadd -Y EXTERNAL -H ldapi:/// -f syncprov-overlay.ldif
+
+7️⃣ Konfigurasi syncrepl ldap01
+cat > syncrepl.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcSyncrepl
+olcSyncrepl: rid=001
+  provider=ldap://ldap02
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+olcSyncrepl: rid=002
+  provider=ldap://ldap03
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncrepl.ldif
+
+8️⃣ Restart ldap01
+systemctl restart slapd
+
+===============================
+🟢 BAGIAN 2 – ldap02 (10.10.1.227)
+===============================
+
+⚠️ Login ke server yang benar (cek IP dulu):
+
+ip a
+
+
+Pastikan:
+
+10.10.1.227
+
+
+dan
+
+hostnamectl set-hostname ldap02
+
+1️⃣ Pastikan base DN benar
+ldapsearch -x -LLL -H ldap://localhost -b "" -s base namingContexts
+
+
+Harus:
+
+dc=ldap,dc=umm
+
+
+Kalau belum → jalankan:
+
+dpkg-reconfigure slapd
+
+
+(dengan nilai sama seperti ldap01)
+
+2️⃣ Pastikan ldapi aktif
+grep SLAPD_SERVICES /etc/default/slapd
+
+
+Pastikan:
+
+SLAPD_SERVICES="ldap:/// ldapi:///"
+
+
+Restart:
+
+systemctl restart slapd
+
+3️⃣ Cek mdb
+ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config '(olcDatabase=mdb)' dn
+
+
+Asumsi {1}.
+
+4️⃣ serverID ldap02
+cat > serverid.ldif <<EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: 2 ldap://ldap02
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f serverid.ldif
+
+5️⃣ module syncprov
+cat > syncprov-module.ldif <<EOF
+dn: cn=module{0},cn=config
+changetype: modify
+add: olcModuleLoad
+olcModuleLoad: syncprov
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncprov-module.ldif
+
+6️⃣ overlay
+cat > syncprov-overlay.ldif <<EOF
+dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcSyncProvConfig
+olcOverlay: syncprov
+olcSpCheckpoint: 100 10
+olcSpSessionlog: 100
+EOF
+
+ldapadd -Y EXTERNAL -H ldapi:/// -f syncprov-overlay.ldif
+
+7️⃣ syncrepl ldap02
+cat > syncrepl.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcSyncrepl
+olcSyncrepl: rid=003
+  provider=ldap://ldap01
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+olcSyncrepl: rid=004
+  provider=ldap://ldap03
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncrepl.ldif
+
+8️⃣ restart
+systemctl restart slapd
+
+===============================
+🟣 BAGIAN 3 – ldap03 (10.10.1.228)
+===============================
+
+Login ke ldap03 (cek IP).
+
+1️⃣ hostname
+hostnamectl set-hostname ldap03
+
+2️⃣ base DN
+ldapsearch -x -LLL -H ldap://localhost -b "" -s base namingContexts
+
+
+Harus:
+
+dc=ldap,dc=umm
+
+3️⃣ ldapi
+grep SLAPD_SERVICES /etc/default/slapd
+systemctl restart slapd
+
+4️⃣ cek mdb
+ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config '(olcDatabase=mdb)' dn
+
+5️⃣ serverID ldap03
+cat > serverid.ldif <<EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: 3 ldap://ldap03
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f serverid.ldif
+
+6️⃣ module
+cat > syncprov-module.ldif <<EOF
+dn: cn=module{0},cn=config
+changetype: modify
+add: olcModuleLoad
+olcModuleLoad: syncprov
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncprov-module.ldif
+
+7️⃣ overlay
+cat > syncprov-overlay.ldif <<EOF
+dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcSyncProvConfig
+olcOverlay: syncprov
+olcSpCheckpoint: 100 10
+olcSpSessionlog: 100
+EOF
+
+ldapadd -Y EXTERNAL -H ldapi:/// -f syncprov-overlay.ldif
+
+8️⃣ syncrepl ldap03
+cat > syncrepl.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcSyncrepl
+olcSyncrepl: rid=005
+  provider=ldap://ldap01
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+olcSyncrepl: rid=006
+  provider=ldap://ldap02
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+EOF
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncrepl.ldif
+
+9️⃣ restart
+systemctl restart slapd
+
+===============================
+🧪 TEST FINAL
+===============================
+
+Tambah data di ldap01:
+
+ldapadd -x -D "cn=admin,dc=ldap,dc=umm" -W <<EOF
+dn: ou=people,dc=ldap,dc=umm
+objectClass: organizationalUnit
+ou: people
+EOF
+
+
+Cek di ldap02:
+
+ldapsearch -x -H ldap://ldap02 -b dc=ldap,dc=umm ou=people
+
+
+Cek di ldap03:
+
+ldapsearch -x -H ldap://ldap03 -b dc=ldap,dc=umm ou=people
