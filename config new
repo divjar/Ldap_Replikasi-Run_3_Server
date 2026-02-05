@@ -1,0 +1,377 @@
+🧱 Topologi
+Host	IP
+ldap01	10.10.1.226
+ldap02	10.10.1.227
+ldap03	10.10.1.228
+
+Domain:
+
+dc=ldap,dc=umm
+
+Admin:
+
+cn=admin,dc=ldap,dc=umm
+password: lsibi5mill4h
+⚠️ PENTING (asumsi)
+
+Semua server:
+
+sudah Ubuntu 24
+
+disk sudah disiapkan:
+
+/var/lib/ldap di disk besar
+
+server lama 226/227/228 sudah benar-benar mati
+
+🟢 STEP 0 — di SEMUA SERVER
+set hostname
+ldap01
+hostnamectl set-hostname ldap01
+ldap02
+hostnamectl set-hostname ldap02
+ldap03
+hostnamectl set-hostname ldap03
+/etc/hosts
+
+di semua server:
+
+nano /etc/hosts
+
+isi:
+
+10.10.1.226 ldap01
+10.10.1.227 ldap02
+10.10.1.228 ldap03
+waktu
+timedatectl set-ntp true
+🟢 STEP 1 — install OpenLDAP
+
+Di SEMUA server
+
+apt update
+apt install -y slapd ldap-utils
+reconfigure slapd (WAJIB)
+dpkg-reconfigure slapd
+
+Jawaban:
+
+Omit OpenLDAP server configuration?  -> No
+DNS domain name: ldap.umm
+Organization name: UMM
+Administrator password: lsibi5mill4h
+Database backend to use: MDB
+Do you want the database to be removed when slapd is purged? -> No
+Move old database? -> Yes
+
+Hasil:
+
+dc=ldap,dc=umm
+cek
+ldapsearch -x -H ldap://localhost -b "" -s base namingContexts
+
+Harus:
+
+dc=ldap,dc=umm
+🟢 STEP 2 — pastikan direktori data LDAP di disk besar
+
+Cek:
+
+ldapsearch -Y EXTERNAL -H ldapi:/// \
+-b "olcDatabase={1}mdb,cn=config" olcDbDirectory
+
+Biasanya:
+
+/var/lib/ldap
+
+Pastikan mount point kamu memang ke disk besar.
+
+🟢 STEP 3 — buat OU people (hanya SEKALI)
+
+Lakukan hanya di ldap01.
+
+people.ldif
+dn: ou=people,dc=ldap,dc=umm
+objectClass: organizationalUnit
+ou: people
+
+Import:
+
+ldapadd -x \
+-D cn=admin,dc=ldap,dc=umm \
+-w lsibi5mill4h \
+-f people.ldif
+🟢 STEP 4 — set ServerID (wajib untuk syncrepl)
+ldap01
+cat > serverid.ldif <<EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: 1 ldap://ldap01
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f serverid.ldif
+ldap02
+cat > serverid.ldif <<EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: 2 ldap://ldap02
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f serverid.ldif
+ldap03
+cat > serverid.ldif <<EOF
+dn: cn=config
+changetype: modify
+add: olcServerID
+olcServerID: 3 ldap://ldap03
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f serverid.ldif
+🟢 STEP 5 — aktifkan syncprov overlay
+
+Lakukan di SEMUA server
+
+load module
+cat > syncprov-module.ldif <<EOF
+dn: cn=module{0},cn=config
+changetype: modify
+add: olcModuleLoad
+olcModuleLoad: syncprov
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncprov-module.ldif
+add overlay
+cat > syncprov-overlay.ldif <<EOF
+dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcSyncProvConfig
+olcOverlay: syncprov
+olcSpCheckpoint: 100 10
+olcSpSessionlog: 100
+EOF
+
+
+ldapadd -Y EXTERNAL -H ldapi:/// -f syncprov-overlay.ldif
+🟢 STEP 6 — set syncrepl multi-master
+
+Sekarang bagian inti.
+
+ldap01
+cat > syncrepl.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcSyncrepl
+olcSyncrepl: rid=001
+  provider=ldap://ldap02
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+olcSyncrepl: rid=002
+  provider=ldap://ldap03
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+-
+add: olcMultiProvider
+olcMultiProvider: TRUE
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncrepl.ldif
+ldap02
+cat > syncrepl.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcSyncrepl
+olcSyncrepl: rid=003
+  provider=ldap://ldap01
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+olcSyncrepl: rid=004
+  provider=ldap://ldap03
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+-
+add: olcMultiProvider
+olcMultiProvider: TRUE
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncrepl.ldif
+ldap03
+cat > syncrepl.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcSyncrepl
+olcSyncrepl: rid=005
+  provider=ldap://ldap01
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+olcSyncrepl: rid=006
+  provider=ldap://ldap02
+  bindmethod=simple
+  binddn="cn=admin,dc=ldap,dc=umm"
+  credentials=lsibi5mill4h
+  searchbase="dc=ldap,dc=umm"
+  type=refreshAndPersist
+  retry="5 5 300 +"
+  timeout=1
+  starttls=no
+-
+add: olcMultiProvider
+olcMultiProvider: TRUE
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f syncrepl.ldif
+🟢 STEP 7 — restart
+
+Di semua server:
+
+systemctl restart slapd
+🟢 STEP 8 — verifikasi replikasi
+
+Di setiap server:
+
+ldapsearch -Y EXTERNAL -H ldapi:/// \
+-b "olcDatabase={1}mdb,cn=config" \
+olcSyncrepl olcMultiProvider
+🟢 STEP 9 — test replikasi data (people)
+
+Test di ldap01:
+
+cat > testuser.ldif <<EOF
+dn: uid=divjar,ou=people,dc=ldap,dc=umm
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+cn: divjar
+sn: divjar
+uid: divjar
+uidNumber: 20001
+gidNumber: 20001
+homeDirectory: /home/divjar
+loginShell: /bin/bash
+EOF
+
+
+ldapadd -x \
+-H ldap://ldap01 \
+-D cn=admin,dc=ldap,dc=umm \
+-w lsibi5mill4h \
+-f testuser.ldif
+
+Cek di ldap02:
+
+ldapsearch -x -H ldap://ldap02 \
+-b "ou=people,dc=ldap,dc=umm" "(uid=divjar)"
+
+Cek di ldap03:
+
+ldapsearch -x -H ldap://ldap03 \
+-b "ou=people,dc=ldap,dc=umm" "(uid=divjar)"
+🟢 STEP 10 — tuning kecil untuk production (disarankan)
+set MDB maxsize
+
+Sesuaikan dengan disk kamu.
+
+Contoh 450GB:
+
+cat > mdbsize.ldif <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+replace: olcDbMaxSize
+olcDbMaxSize: 450000000000
+EOF
+
+
+ldapmodify -Y EXTERNAL -H ldapi:/// -f mdbsize.ldif
+🟢 STEP 11 — HAL PENTING YANG SENGAJA SAYA TIDAK LANGSUNG AKTIFKAN
+
+Untuk production sungguhan (FreeRADIUS, 802.1X, dsb):
+
+👉 sebaiknya:
+
+aktifkan TLS
+
+ganti bind simple ke StartTLS
+
+Tapi karena sebelumnya environment kamu juga plain LDAP,
+step di atas saya buat konsisten dulu.
+
+⚠️ CATATAN PENTING (jujur)
+
+Konfigurasi ini:
+
+✅ benar multi-master
+✅ cocok untuk 3 node
+✅ sama dengan yang kemarin kamu jalankan
+✅ aman untuk people tree
+
+Tetapi:
+
+👉 OpenLDAP multi-master tidak punya conflict resolution cerdas.
+
+Artinya:
+
+jangan edit entry yang sama dari dua server di waktu bersamaan
+
+(ini penting untuk operasi)
+
+✅ Ringkasan super singkat
+
+Urutan:
+
+install slapd di 3 server
+
+dpkg-reconfigure
+
+buat ou=people di ldap01
+
+set olcServerID
+
+load syncprov
+
+add syncprov overlay
+
+set syncrepl masing-masing node
+
+restart
+
+test user
+
+set mdb maxsize
